@@ -1,0 +1,938 @@
+---
+title: "bsc_project"
+output: html_document
+date: "2024-12-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#setwd("Desktop/AarhusUni/Semester5/BSc project")
+```
+
+## Loading packages and data 
+```{r}
+# loading packages
+
+library(tidyverse)
+library(dagitty)
+library(rethinking)
+```
+```{r}
+# loading data
+ 
+preprocessed_data <- read_csv("../data/preprocessed_data.csv")
+```
+## Refactoring the data
+```{r}
+# creating a new dataframe with only the columns: "receiving_agent", "Agent_list", and the "glowchum_count_turn3"
+
+df <- preprocessed_data %>% select(Receiving_agent, Agent_list, Glowchum_count_turn3)
+```
+
+```{r}
+# now we will make a column for the "Glowchum_count_turn3" variable that is a binary variable
+# recode Glowchum_count_turn3 into 2 classes
+df$binary_turn3 <- ifelse(df$Glowchum_count_turn3 == 0,
+  0,
+  1
+)
+
+# turn it into a factor
+# set labels for binary_turn3
+df$binary_turn3 <- factor(df$binary_turn3,
+  levels = c(0, 1),
+  labels = c("Glowchum not mentioned", "Glowchum mentioned"))
+  
+# recode receiving_agent
+df$Receiving_agent <- factor(df$Receiving_agent)
+```
+
+basic descriptive statistics
+```{r}
+summary(df)
+```
+# Binary logisitic regression in R
+
+## Univariable binary logistic regression
+We will use the glm() function and the family = "binomial" argument.
+```{r}
+# univariable binary logistic regression
+# model 1
+m1 <- glm(binary_turn3 ~ Receiving_agent, data = df, family = "binomial")
+
+summary(m1)
+```
+The summary results show that the personality trait of the receiving agent does not seem to have a significant effect on the propensity of an agent picking up on a new word. 
+
+```{r}
+table(df$Receiving_agent)
+summary(df$binary_turn3)
+df$Receiving_agent_num <- as.numeric(df$Receiving_agent)
+df$binary_turn3 <- as.numeric(df$binary_turn3)
+df$binary_turn3 <- df$binary_turn3 -1 
+summary(df$binary_turn3)
+
+```
+```{r}
+sum(is.na(df))  # Total NA values
+sum(is.na(df$binary_turn3))  # NA in binary_turn3
+sum(is.na(df$Receiving_agent_num))  # NA in Receiving_agent
+unique(df$binary_turn3)
+```
+
+
+
+## Bayesian binary logistic regression
+```{r}
+
+# creating model
+bm1 <- quap(
+  alist(
+    binary_turn3 ~ dbinom(1, p),
+    logit(p) <- a + b[Receiving_agent_num],
+    a ~ dnorm(0, 1.5),
+    b[Receiving_agent_num] ~ dnorm(0, 0.5)
+  ),
+  data = df
+)
+set.seed(1999)
+prior <- extract.prior( bm1 , n=1e4 )
+p <- sapply( 1:4 , function(k) inv_logit( prior$a + prior$b[,k] ) )
+mean( abs( p[,1] - p[,2] ) )
+
+```
+
+```{r}
+# prior trimmed data list
+dat_list <- list(
+binary_turn3 = df$binary_turn3,
+Receiving_agent = as.integer(df$Receiving_agent_num)
+)
+```
+
+```{r}
+bm1_final <- ulam(
+alist(
+    binary_turn3 ~ dbinom(1, p),
+    logit(p) <- a[Receiving_agent],
+    a[Receiving_agent] ~ dnorm(0, 1.5)
+), data=dat_list, chains=4 , log_lik=TRUE )
+precis( bm1_final , depth=2 )
+```
+```{r}
+post <- extract.samples(bm1_final)
+p_left <- inv_logit( post$a )
+labs <- c("High_agree","High_consc","High_extra","High_neuro", "High_open")
+plot( precis( as.data.frame(p_left) ) , xlim=c(0,1) , labels=labs, xlab="propensity to pick up new word given personality type" )
+```
+
+# Aggregated binomial logistic regression
+```{r}
+d_aggregated <- aggregate(
+df$binary_turn3 ,
+list( receiving_agent=df$Receiving_agent , receiving_agent_num=df$Receiving_agent_num) ,
+sum )
+colnames(d_aggregated)[3] <- "Glowchum_mentioned"
+# get the number of instances with each receiving agent in the original data
+# Frequency of each Receiving_agent
+frequency <- as.data.frame(table(df$Receiving_agent))
+
+# Rename columns for clarity
+colnames(frequency) <- c("receiving_agent", "Frequency")
+frequency$receiving_agent <- as.character(frequency$receiving_agent)
+d_aggregated$receiving_agent <- as.character(d_aggregated$receiving_agent)
+
+# Merge frequency into aggregated_df
+d_aggregated <- merge(d_aggregated, frequency, by = "receiving_agent", all.x = TRUE)
+
+# Step 5: Rename "Frequency" to "Simulations"
+colnames(d_aggregated)[colnames(d_aggregated) == "Frequency"] <- "simulations"
+
+````
+
+```{r}
+dat_list <- list(
+glowchum_mentioned = d_aggregated$Glowchum_mentioned,
+simulations = d_aggregated$simulations,
+Receiving_agent = as.integer(d_aggregated$receiving_agent_num)
+)
+bm2_aggregated <- ulam(
+alist(
+glowchum_mentioned ~ dbinom( simulations , p ) ,
+logit(p) <- a[Receiving_agent],
+    a[Receiving_agent] ~ dnorm(0, 1.5)
+) , data=dat_list , chains=4 , log_lik=TRUE )
+precis( bm2_aggregated , depth=2 )
+```
+# Model comparison
+```{r}
+compare( bm1_final , bm2_aggregated , func=PSIS )
+```
+
+```{r}
+post <- extract.samples(bm2_aggregated)
+
+names <- c("high_agree", "high_consc", "high_extra", "high_neuro", "high_open")
+
+# Initialize lists to store results
+diff_a_list <- list()
+diff_p_list <- list()
+
+# Compute pairwise differences
+for (i in 1:(length(names) - 1)) {
+  for (j in (i + 1):length(names)) {
+    diff_a_list[[paste0(names[i], " - ", names[j])]] <- post$a[, i] - post$a[, j]
+    diff_p_list[[paste0("inv_logit(", names[i], ") - inv_logit(", names[j], ")")]] <- 
+      inv_logit(post$a[, i]) - inv_logit(post$a[, j])
+  }
+}
+precis(diff_a_list)
+precis(diff_p_list)
+
+
+```
+
+```{r}
+
+# Suppress axes and labels in the plotting region
+postcheck(bm2_aggregated, xaxt = "n", yaxt = "n")
+
+```
+# Research question 2
+```{r}
+df2 <- preprocessed_data %>% select(Receiving_agent, Introducing_agent, Glowchum_count_turn3)
+```
+
+```{r}
+# now we will make a column for the "Glowchum_count_turn3" variable that is a binary variable
+# recode Glowchum_count_turn3 into 2 classes
+df2$binary_turn3 <- ifelse(df2$Glowchum_count_turn3 == 0,
+  0,
+  1
+)
+
+# turn it into a factor
+# set labels for binary_turn3
+df2$binary_turn3 <- factor(df2$binary_turn3,
+  levels = c(0, 1),
+  labels = c("Glowchum not mentioned", "Glowchum mentioned"))
+
+# recode receiving_agent
+df2$Receiving_agent <- factor(df2$Receiving_agent)
+df2$Introducing_agent <- factor(df2$Introducing_agent)
+```
+
+```{r}
+summary(df2)
+```
+```{r}
+# model 2
+m2 <- glm(binary_turn3 ~ Receiving_agent:Introducing_agent, data = df2, family = "binomial")
+
+#exp(coef(m2)) 
+summary(m2)
+```
+
+It seems that incorporating the introducing agent into the model is not possible for normal frequentist logistic regression. We will now try to do this using a Bayesian approach.
+
+# Bayesian binary logistic regression
+```{r}
+summary(df2)
+df2$binary_turn3 <- as.numeric(df2$binary_turn3)
+unique(df2$binary_turn3)
+
+```
+```{r}
+# remove 1 from df2$binary_turn3
+df2$binary_turn3 <- df2$binary_turn3 -1
+unique(df2$binary_turn3)
+```
+
+
+```{r}
+#df2$Receiving_agent_num <- as.numeric(df$Receiving_agent)
+
+# prior trimmed data list
+d_aggregated <- aggregate(
+df2$binary_turn3 ,
+list( receiving_agent=df$Receiving_agent , receiving_agent_num=df$Receiving_agent_num, introducing_agent=df2$Introducing_agent) ,
+sum )
+d_aggregated$introducing_agent_num <- as.integer(d_aggregated$introducing_agent)
+colnames(d_aggregated)[4] <- "Glowchum_mentioned"
+# Step 1: Count frequency of each combination of Receiving_agent and Introducing_agent
+combination_frequency <- as.data.frame(table(df2$Receiving_agent, df2$Introducing_agent))
+
+# Step 2: Rename columns for clarity
+colnames(combination_frequency) <- c("receiving_agent", "introducing_agent", "Frequency")
+# Step 3: Ensure both variables are characters for consistency
+combination_frequency$receiving_agent <- as.character(combination_frequency$receiving_agent)
+combination_frequency$introducing_agent <- as.character(combination_frequency$introducing_agent)
+d_aggregated$receiving_agent <- as.character(d_aggregated$receiving_agent)
+d_aggregated$introducing_agent <- as.character(d_aggregated$introducing_agent)
+
+# Step 4: Merge frequency into the aggregated dataframe
+d_aggregated <- merge(d_aggregated, combination_frequency, 
+                      by = c("receiving_agent", "introducing_agent"), 
+                      all.x = TRUE)
+
+# Step 5: Rename "Frequency" to "Simulations"
+colnames(d_aggregated)[colnames(d_aggregated) == "Frequency"] <- "simulations"
+```
+
+```{r}
+summary(d_aggregated)
+```
+
+
+```{r}
+
+dat_list <- list(
+glowchum_mentioned = d_aggregated$Glowchum_mentioned,
+simulations = d_aggregated$simulations,
+Receiving_agent = as.integer(d_aggregated$receiving_agent_num),
+Introducing_agent = as.integer(d_aggregated$introducing_agent_num)
+)
+
+dat_list$Receiving_agent <- as.integer(as.factor(dat_list$Receiving_agent))
+dat_list$Introducing_agent <- as.integer(as.factor(dat_list$Introducing_agent))
+```
+
+
+```{r}
+table(dat_list$Receiving_agent)
+unique(dat_list$Receiving_agent)
+```
+
+
+```{r}
+bm2_1_introducing <- ulam(
+  alist(
+    glowchum_mentioned ~ dbinom( simulations , p ) ,
+    logit(p) <- a[Receiving_agent]+b[Introducing_agent] ,
+    a[Receiving_agent] ~ dnorm( 0 , 1.5 ) ,
+    b[Introducing_agent] ~ dnorm( 0 , 1.5 )
+    ) , data=dat_list , chains=4, log_lik = TRUE)
+precis( bm2_1_introducing , depth=2)
+```
+
+
+
+```{r}
+bm2_1_introducing_interaction <- ulam(
+  alist(
+    glowchum_mentioned ~ dbinom(simulations, p),  # Binomial likelihood
+    logit(p) <- a[Receiving_agent] + b[Introducing_agent]*Receiving_agent,  # Interaction term
+    a[Receiving_agent] ~ dnorm(0, 1.5),  # Prior for Receiving_agent main effects
+    b[Introducing_agent] ~ dnorm(0, 1.5)  # Prior for Introducing_agent main effects
+  ),
+  data = dat_list,
+  chains = 4,
+  log_lik = TRUE
+)
+precis( bm2_1_introducing_interaction , depth=2)
+```
+ 
+```{r}
+compare( bm1_final , bm2_aggregated,bm2_1_introducing, bm2_1_introducing_interaction, func=PSIS )
+
+```
+# BRMS workflow
+```{r}
+dat_list$Receiving_agent <- as.factor(dat_list$Receiving_agent)
+dat_list$Introducing_agent <- as.factor(dat_list$Introducing_agent)
+
+
+library(brms)
+brms2_1_full_model <- brm(
+  formula = glowchum_mentioned | trials(simulations) ~ (1 | Receiving_agent) + (1 | Introducing_agent) + (1 | Receiving_agent:Introducing_agent),
+  family = binomial(link = "logit"),  # Binomial likelihood with logit link
+  data = dat_list,
+  prior = c(
+    prior(normal(0, 1.5), class = "Intercept"),  # Default intercept prior
+    prior(normal(0, 1.5), class = "sd", group = "Receiving_agent"),  # Prior for Receiving_agent
+    prior(normal(0, 1.5), class = "sd", group = "Introducing_agent"),  # Prior for Introducing_agent
+    prior(normal(0, 1.5), class = "sd", group = "Receiving_agent:Introducing_agent")  # Prior for interaction
+  ),
+  chains = 4,
+  cores = 4
+)
+
+# Summarize posterior estimates
+summary(brms2_1_full_model)
+
+# Check model diagnostics
+pp_check(brms2_1_full_model)  # Posterior predictive checks
+
+# Plot posterior distributions
+plot(brms2_1_full_model)
+```
+```{r}
+brms2_1_only_interaction <- brm(
+  formula = glowchum_mentioned | trials(simulations) ~ 0 + Receiving_agent:Introducing_agent,
+  family = binomial(link = "logit"),  # Binomial likelihood with logit link
+  data = dat_list,
+  prior = c(
+    prior(normal(0, 1.5), class = "b")  # Prior for interaction
+  ),
+  chains = 4,
+  cores = 4
+)
+
+# Summarize posterior estimates
+summary(brms2_1_only_interaction)
+
+# Check model diagnostics
+pp_check(brms2_1_only_interaction)  # Posterior predictive checks
+
+# Plot posterior distributions
+plot(brms2_1_only_interaction)
+
+
+# Compute estimated marginal means for the interaction
+interaction_emm <- emmeans(brms2_1_only_interaction, ~ Receiving_agent:Introducing_agent)
+
+# Extract interaction effects as a data frame
+interaction_emm_df <- as.data.frame(interaction_emm)
+
+
+# Convert log-odds to probabilities
+interaction_emm_df <- interaction_emm_df %>%
+  mutate(
+    Probability = exp(emmean) / (1 + exp(emmean)),  # Mean probability
+    Lower_95_CI = exp(lower.HPD) / (1 + exp(lower.HPD)),  # Lower bound of CI
+    Upper_95_CI = exp(upper.HPD) / (1 + exp(upper.HPD))   # Upper bound of CI
+  )
+
+# View the updated data frame
+head(interaction_emm_df)
+
+# Summarize probabilities by introducing agent
+introducing_agent_summary <- interaction_emm_df %>%
+  group_by(Introducing_agent) %>%
+  summarize(
+    Mean_Probability = mean(Probability),
+    Lower_95_CI = mean(Lower_95_CI),
+    Upper_95_CI = mean(Upper_95_CI)
+  )
+
+# View the summary
+print(introducing_agent_summary)
+```
+```{r}
+
+ggplot(introducing_agent_summary, aes(x = Introducing_agent, y = Mean_Probability)) +
+  geom_bar(stat = "identity", fill = "skyblue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = Lower_95_CI, ymax = Upper_95_CI), width = 0.2) +
+  labs(
+    title = "Mean Probability of Word Adoption by Introducing Agent",
+    x = "Introducing Agent",
+    y = "Mean Probability of Word Adoption"
+  ) +
+  theme_minimal()
+
+
+# Convert the EMMs to probabilities
+interaction_emm_prob <- emmeans(brms2_1_only_interaction, ~ Receiving_agent:Introducing_agent, type = "response")
+
+# View probabilities
+summary(interaction_emm_prob)
+# Convert emmeans results to a data frame
+interaction_emm_df <- as.data.frame(interaction_emm)
+
+# Heatmap of probabilities
+ggplot(interaction_emm_df, aes(x = Introducing_agent, y = Receiving_agent, fill = emmean)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Word Adoption Probabilities by Interaction of Agents",
+    x = "Introducing Agent",
+    y = "Receiving Agent",
+    fill = "Probability"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+library(emmeans)
+# Perform pairwise comparisons for introducing agents
+introducing_agent_emm <- emmeans(brms2_1_only_interaction, ~ Introducing_agent)
+pairwise_comparisons_intro <- contrast(introducing_agent_emm, method = "pairwise")
+
+# View the results
+summary(pairwise_comparisons_intro)
+
+# Convert emmeans results to a data frame
+interaction_emm_df <- as.data.frame(interaction_emm_prob)
+
+# Calculate the mean probability of word adoption for each introducing agent
+introducing_agent_summary <- interaction_emm_df %>%
+  group_by(Introducing_agent) %>%
+  summarize(
+    Mean_Probability = mean(prob),
+    Lower_95_CI = mean(as.numeric(as.character(lower.HPD))),
+    Upper_95_CI = mean(as.numeric(as.character(upper.HPD)))
+  )
+
+# View the summary
+print(introducing_agent_summary)
+```
+
+```{r}
+interaction_summary <- interaction_emm_df %>%
+  group_by(Receiving_agent, Introducing_agent) %>%
+  summarize(
+    Mean_Probability = mean(prob),
+    Lower_95_CI = mean(as.numeric(as.character(lower.HPD))),
+    Upper_95_CI = mean(as.numeric(as.character(upper.HPD)))
+  )
+
+# View the interaction summary
+print(interaction_summary)
+
+# Perform pairwise comparisons for interaction effects
+pairwise_interaction <- contrast(interaction_emm, method = "pairwise")
+
+# Convert to a data frame for easier manipulation
+pairwise_df <- as.data.frame(summary(pairwise_interaction))
+library(tidyverse)
+# Filter for significant differences (CI does not include zero)
+significant_pairs <- pairwise_df %>%
+  filter(lower.HPD > 0 | upper.HPD < 0)
+
+# View the significant pairs
+print(significant_pairs)
+
+```
+
+
+```{r}
+library(ggplot2)
+library(viridis)  # For APA-compliant color palette
+# Define the mapping for personality traits
+personality_traits <- c(
+  "1" = "Agreeableness",
+  "2" = "Conscientiousness",
+  "3" = "Extraversion",
+  "4" = "Neuroticism", "5" = "Openness")
+
+# Add new columns for personality traits
+interaction_emm_df <- interaction_emm_df %>%
+  mutate(
+    Introducing_agent = personality_traits[as.character(Introducing_agent)],
+    Receiving_agent = personality_traits[as.character(Receiving_agent)]
+  )
+
+
+# Create the heatmap
+ggplot(interaction_emm_df, aes(x = Introducing_agent, y = Receiving_agent, fill = prob)) +
+  geom_tile(color = "white", lwd = 0.5) +  # White tile borders for clarity
+  scale_fill_viridis_c(option = "set2", direction = -1) +  # Subtle color palette
+  labs(
+    title = "Heatmap of Word Adoption Probabilities by Introducing and Receiving Agents",
+    x = "Introducing Agent",
+    y = "Receiving Agent",
+    fill = "Probability"
+  ) +
+  theme_minimal(base_size = 12, base_family = "Times New Roman") +  # APA-compliant font
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),  # Center and bold title
+    axis.title = element_text(face = "bold", size = 12),  # Bold axis titles
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 10),  # Rotate x-axis labels
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    legend.position = "right",  # Place legend to the right
+    legend.title = element_text(face = "bold"),  # Bold legend title
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank()   # Remove minor gridlines
+  )
+
+
+
+```
+
+
+
+```{r}
+# Fit the model in brms
+brms2_simple<- brm(
+  formula = glowchum_mentioned | trials(simulations) ~ 1 + (1 | Receiving_agent),  # intercept and random effects for Receiving_agent
+  family = binomial(link = "logit"),  # Binomial likelihood with logit link
+  data = dat_list,
+  prior = c(
+    prior(normal(0, 1.5), class = "sd", group = "Receiving_agent")  # Prior for random effects
+  ),
+  chains = 4,
+  cores = 4
+)
+
+brms2_simple_no_intercept<- brm(
+  formula = glowchum_mentioned | trials(simulations) ~ 0 + (1 | Receiving_agent),  # No intercept; random effects for Receiving_agent
+  family = binomial(link = "logit"),  # Binomial likelihood with logit link
+  data = dat_list,
+  prior = c(
+    prior(normal(0, 1.5), class = "sd", group = "Receiving_agent")  # Prior for random effects
+  ),
+  chains = 4,
+  cores = 4
+)
+```
+
+```{r}
+summary(brms2_simple)
+
+# Extract random effects for Receiving_agent
+ranef_simple <- ranef(brms2_simple)
+
+# Print the random effects for Receiving_agent
+print(ranef_simple$Receiving_agent)
+# Extract random effects
+ranef_simple <- ranef(brms2_simple)$Receiving_agent
+
+# Apply inverse logit to convert to probabilities
+inv_logit <- function(x) exp(x) / (1 + exp(x))
+
+# Convert estimates and credible intervals to probabilities
+ranef_simple_probs <- data.frame(
+  Mean = inv_logit(ranef_simple[, "Estimate", "Intercept"]),
+  SD = ranef_simple[, "Est.Error", "Intercept"],  # SD stays the same
+  Q2.5 = inv_logit(ranef_simple[, "Q2.5", "Intercept"]),
+  Q97.5 = inv_logit(ranef_simple[, "Q97.5", "Intercept"])
+)
+
+# Print probabilities
+print(ranef_simple_probs)
+
+summary(brms2_simple_no_intercept)
+# Extract random effects
+ranef_no_intercept <- ranef(brms2_simple_no_intercept)$Receiving_agent
+
+# Convert estimates and credible intervals to probabilities
+ranef_no_intercept_probs <- data.frame(
+  Mean = inv_logit(ranef_no_intercept[, "Estimate", "Intercept"]),
+  SD = ranef_no_intercept[, "Est.Error", "Intercept"],  # SD stays the same
+  Q2.5 = inv_logit(ranef_no_intercept[, "Q2.5", "Intercept"]),
+  Q97.5 = inv_logit(ranef_no_intercept[, "Q97.5", "Intercept"])
+)
+
+# Print probabilities
+print(ranef_no_intercept_probs)
+
+# Extract random effects for Receiving_agent
+ranef_no_intercept <- ranef(brms2_simple_no_intercept)
+
+# Print the random effects for Receiving_agent
+print(ranef_no_intercept$Receiving_agent)
+```
+
+```{r}
+brms2_1_full_no_inter <- brm(
+  formula = glowchum_mentioned | trials(simulations) ~ 0 + (1 | Receiving_agent) + (1 | Introducing_agent),
+  family = binomial(link = "logit"),  # Binomial likelihood with logit link
+  data = dat_list,
+  prior = c(
+    #prior(normal(0, 1.5), class = "Intercept"),  # Default intercept prior
+    prior(normal(0, 1.5), class = "sd", group = "Receiving_agent"),  # Prior for Receiving_agent
+    prior(normal(0, 1.5), class = "sd", group = "Introducing_agent")  # Prior for Introducing_agent
+  ),
+  chains = 4,
+  cores = 4
+)
+
+summary(brms2_1_full_no_inter)
+
+# Extract random effects for Receiving_agent
+ranef_full_no_inter <- ranef(brms2_1_full_no_inter)
+
+# Print the random effects for Receiving_agent
+print(ranef_full_no_inter$Receiving_agent)
+
+# Print the random effects for Introducing_agent
+print(ranef_full_no_inter$Introducing_agent)
+```
+
+```{r}
+brms2_simple <- add_criterion(brms2_simple, "loo")
+brms2_simple_no_intercept <- add_criterion(brms2_simple_no_intercept, "loo")
+brms2_1_full_model <- add_criterion(brms2_1_full_model, "loo")
+brms2_1_full_no_inter <- add_criterion(brms2_1_full_no_inter, "loo")
+brms2_1_only_interaction <- add_criterion(brms2_1_only_interaction, "loo")
+loo_comparison <- loo_compare(brms2_simple, brms2_simple_no_intercept, brms2_1_full_model, brms2_1_full_no_inter, brms2_1_only_interaction)
+loo_model_weights(brms2_simple, brms2_simple_no_intercept, brms2_1_full_model, brms2_1_full_no_inter, brms2_1_only_interaction)
+print(loo_comparison)
+#bayes_factor <- bayes_factor(brms2_simple, brms2_simple_no_intercept, brms2_1_full_model, brms2_1_full_no_inter, brms2_1_only_interaction)
+#print(bayes_factor)
+```
+```{r}
+# Compute WAIC for all models
+waic_simple <- waic(brms2_simple)
+waic_no_intercept <- waic(brms2_simple_no_intercept)
+waic_full <- waic(brms2_1_full_model)
+waic_full_no_inter <- waic(brms2_1_full_no_inter)
+waic_only_interaction <- waic(brms2_1_only_interaction)
+
+# Compare WAIC values
+waic_comparison <- loo_compare(waic_simple, waic_no_intercept, waic_full, 
+                               waic_full_no_inter, waic_only_interaction)
+
+# Print the WAIC comparison table
+print(waic_comparison)
+```
+
+
+
+```{r}
+# Extract LOO results for each model
+loo_simple <- loo(brms2_simple)
+loo_no_intercept <- loo(brms2_simple_no_intercept)
+loo_full_model <- loo(brms2_1_full_model)
+loo_full_no_inter <- loo(brms2_1_full_no_inter)
+
+# Print Pareto diagnostics
+print(loo_simple)
+print(loo_no_intercept)
+print(loo_full_model)
+print(loo_full_no_inter)
+
+# Visualize Pareto k values
+plot(loo_simple)
+plot(loo_no_intercept)
+plot(loo_full_model)
+plot(loo_full_no_inter)
+```
+
+```{r}
+get_prior(
+  formula = glowchum_mentioned | trials(simulations) ~ 1 + Receiving_agent,
+  family = binomial(link = "logit"),
+  data = dat_list
+)
+
+brms2_fixed<- brm(
+  formula = glowchum_mentioned | trials(simulations) ~ 0 + Receiving_agent,  # intercept and random effects for Receiving_agent
+  family = binomial(link = "logit"),  # Binomial likelihood with logit link
+  data = dat_list,
+  prior = c(
+    prior(normal(0, 1.5), class = "b"),
+    prior(normal(0, 1.5), class = "b", coef = "Receiving_agent2"),
+    prior(normal(0, 1.5), class = "b", coef = "Receiving_agent3"),
+    prior(normal(0, 1.5), class = "b", coef = "Receiving_agent4"),
+    prior(normal(0, 1.5), class = "b", coef = "Receiving_agent5")
+  # Prior for random effects
+  ),
+  chains = 4,
+  cores = 4
+)
+
+summary(brms2_fixed)
+
+# Extract posterior draws for the receiving agents
+library(posterior)
+
+posterior_draws <- as_draws_df(brms2_fixed)
+# Transform log-odds to probabilities for Receiving_agent1
+prob_receiving_agent1 <- exp(posterior_draws$b_Receiving_agent1) / 
+                         (1 + exp(posterior_draws$b_Receiving_agent1))
+
+# Similarly, for other agents
+prob_receiving_agent2 <- exp(posterior_draws$b_Receiving_agent2) / 
+                         (1 + exp(posterior_draws$b_Receiving_agent2))
+
+prob_receiving_agent3 <- exp(posterior_draws$b_Receiving_agent3) / 
+                         (1 + exp(posterior_draws$b_Receiving_agent3))
+
+prob_receiving_agent4 <- exp(posterior_draws$b_Receiving_agent4) / 
+                         (1 + exp(posterior_draws$b_Receiving_agent4))
+
+prob_receiving_agent5 <- exp(posterior_draws$b_Receiving_agent5) / 
+                         (1 + exp(posterior_draws$b_Receiving_agent5))
+
+
+
+```
+
+```{r}
+# Example for Agent 1
+summary_agent1 <- data.frame(Probability = prob_receiving_agent1) %>%
+  summarize(
+    Mean = mean(Probability),
+    Lower_95_CI = quantile(Probability, 0.025),
+    Upper_95_CI = quantile(Probability, 0.975)
+  )
+
+# Repeat for other agents
+summary_agent2 <- data.frame(Probability = prob_receiving_agent2) %>%
+  summarize(
+    Mean = mean(Probability),
+    Lower_95_CI = quantile(Probability, 0.025),
+    Upper_95_CI = quantile(Probability, 0.975)
+  )
+
+# Repeat for other agents
+summary_agent3 <- data.frame(Probability = prob_receiving_agent3) %>%
+  summarize(
+    Mean = mean(Probability),
+    Lower_95_CI = quantile(Probability, 0.025),
+    Upper_95_CI = quantile(Probability, 0.975)
+  )
+
+# Repeat for other agents
+summary_agent4 <- data.frame(Probability = prob_receiving_agent4) %>%
+  summarize(
+    Mean = mean(Probability),
+    Lower_95_CI = quantile(Probability, 0.025),
+    Upper_95_CI = quantile(Probability, 0.975)
+  )
+
+# Repeat for other agents
+summary_agent5 <- data.frame(Probability = prob_receiving_agent5) %>%
+  summarize(
+    Mean = mean(Probability),
+    Lower_95_CI = quantile(Probability, 0.025),
+    Upper_95_CI = quantile(Probability, 0.975)
+  )
+```
+
+```{r}
+# Combine summaries into a single dataframe for plotting
+agent_summary <- data.frame(
+  Receiving_agent = factor(1:5, labels = c("High_Agree", "High_Consc", "High_Extra", "High_Neuro", "High_Open")),
+  Mean_Probability = c(summary_agent1$Mean, summary_agent2$Mean, summary_agent3$Mean, 
+                       summary_agent4$Mean, summary_agent5$Mean),
+  Lower_CI = c(summary_agent1$Lower_95_CI, summary_agent2$Lower_95_CI, summary_agent3$Lower_95_CI, 
+               summary_agent4$Lower_95_CI, summary_agent5$Lower_95_CI),
+  Upper_CI = c(summary_agent1$Upper_95_CI, summary_agent2$Upper_95_CI, summary_agent3$Upper_95_CI, 
+               summary_agent4$Upper_95_CI, summary_agent5$Upper_95_CI)
+)
+
+# Assuming you have posterior probability samples stored for each agent:
+posterior_draws_prob <- data.frame(
+  High_Agree = prob_receiving_agent1,  # Posterior draws for Agent 1
+  High_Consc = prob_receiving_agent2,  # Posterior draws for Agent 2
+  High_Extra = prob_receiving_agent3,  # Posterior draws for Agent 3
+  High_Neuro = prob_receiving_agent4,  # Posterior draws for Agent 4
+  High_Open = prob_receiving_agent5   # Posterior draws for Agent 5
+)
+
+# Reshape data for plotting
+
+density_data <- posterior_draws_prob %>%
+  pivot_longer(cols = everything(), names_to = "Receiving_agent", values_to = "Probability")
+
+head(density_data)
+#density_data$Receiving_agent <- factor(density_data$Receiving_agent, levels = c("High_Agree", "High_Consc", "High_Extra", "High_Neuro", "High_Open"))
+library(ggridges)
+#install.packages("ggthemes")
+library(ggthemes) # For APA-style fonts and themes
+
+
+
+# Clean and APA-compliant ridgeline plot
+ggplot(density_data, aes(x = Probability, y = Receiving_agent, fill = Receiving_agent)) +
+  geom_density_ridges(scale = 0.9, alpha = 0.6, color = "black") +  # Softer lines and reduced overlap
+  scale_fill_brewer(palette = "Set2") +  # APA-compliant, subtle color palette
+  labs(
+    title = "Posterior Density of Word Adoption Probabilities by Receiving Agent",
+    x = "Probability of Word Adoption",
+    y = "Receiving Agent"
+  ) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +  # Use Times New Roman as per APA
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),  # Center-align and bold title
+    axis.title = element_text(face = "bold"),  # Bold axis titles
+    axis.text = element_text(size = 10),  # Adjust axis text size
+    axis.line = element_line(color = "black"),  # Add clean axis lines
+    #panel.grid.major = element_blank(),  # Remove major gridlines
+    #panel.grid.minor = element_blank(),  # Remove minor gridlines
+    legend.position = "right"  # Remove legend for a cleaner look
+  )
+
+
+```
+
+```{r}
+library(brms)
+pp_check(brms2_fixed)
+
+```
+
+```{r}
+library(emmeans)
+pairwise_comparisons <- emmeans(brms2_fixed, ~ Receiving_agent)
+summary(pairwise_comparisons)
+pairs(pairwise_comparisons)
+
+library(dplyr)
+
+library(dplyr)
+library(knitr)
+
+# Combine the summary data for all agents into a single dataframe
+model_estimates_table <- data.frame(
+  Receiving_Agent = c("High_Agree", "High_consc", "High_Extra", "High_Neuro", "High_Open"),
+  Mean_Probability = c(summary_agent1$Mean, summary_agent2$Mean, summary_agent3$Mean, 
+                       summary_agent4$Mean, summary_agent5$Mean),
+  Lower_95_CI = c(summary_agent1$Lower_95_CI, summary_agent2$Lower_95_CI, summary_agent3$Lower_95_CI, 
+                  summary_agent4$Lower_95_CI, summary_agent5$Lower_95_CI),
+  Upper_95_CI = c(summary_agent1$Upper_95_CI, summary_agent2$Upper_95_CI, summary_agent3$Upper_95_CI, 
+                  summary_agent4$Upper_95_CI, summary_agent5$Upper_95_CI)
+)
+
+# Create the APA-style table
+kable(
+  model_estimates_table, 
+  col.names = c("Receiving Agent", "Mean Probability", "Lower 95% CI", "Upper 95% CI"),
+  digits = 3,  # Format numbers to 3 decimal places
+  caption = "Model Estimates for Word Adoption Probabilities by Receiving Agent"
+)
+
+
+```
+
+
+```{r}
+# Generate pairwise contrasts
+pairwise_comparisons <- emmeans(brms2_fixed, ~ Receiving_agent) %>%
+  contrast(method = "pairwise") %>%
+  summary()
+
+# Create a clean table of pairwise results
+pairwise_table <- as.data.frame(pairwise_comparisons)
+
+# Add a significance column based on CI exclusion of 0
+pairwise_table <- pairwise_table %>%
+  mutate(Significant = ifelse(lower.HPD > 0 | upper.HPD < 0, "Yes", "No"))
+
+# Print the table
+kable(pairwise_table[, c("contrast", "estimate", "lower.HPD", "upper.HPD", "Significant")],
+      col.names = c("Contrast", "Estimate (Log Odds)", "Lower 95% CI", "Upper 95% CI", "Significant"),
+      digits = 3)
+```
+
+
+```{r}
+library(loo)
+
+# Compute LOO for both models
+loo_baseline <- loo(brms2_fixed)
+loo_interaction <- loo(brms2_1_only_interaction)
+
+# Compare the models
+install.packages("bayestestR")
+loo_compare(loo_baseline, loo_interaction)
+bayes_factor(brms_interaction, brms_baseline)
+```
+
+
+
+
+```{r}
+brms2_fixed <- add_criterion(brms2_fixed, "loo")
+brms2_fixed_intro <- add_criterion(brms2_fixed_intro, "loo")
+brms2_fixed_full <- add_criterion(brms2_fixed_full, "loo")
+loo_comparison <- loo_compare(brms2_fixed, brms2_fixed_intro, brms2_fixed_full)
+loo_model_weights(brms2_fixed, brms2_fixed_intro, brms2_fixed_full)
+print(loo_comparison)
+```
+
+
